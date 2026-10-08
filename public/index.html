@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Downloader</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f3f4f6; margin: 0; }
+        .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; width: 100%; max-width: 400px; }
+        input { width: 90%; padding: 10px; margin-bottom: 15px; border: 1px solid #d1d5db; border-radius: 4px; outline: none; }
+        input:focus { border-color: #3b82f6; }
+        button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; }
+        button:hover { background: #2563eb; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Video Downloader</h2>
+        <p>Paste your link below:</p>
+        <form action="/download" method="GET">
+            <input type="url" name="url" placeholder="https://www.youtube.com/..." required>
+            <button type="submit">Download Video</button>
+        </form>
+    </div>
+</body>
+</html>

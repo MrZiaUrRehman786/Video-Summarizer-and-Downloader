@@ -1,0 +1,19 @@
+# Secrets (IMPORTANT)
+cookies.txt
+*.txt.cookies
+.env
+
+# Dependencies
+node_modules/
+
+# Downloaded videos
+downloads/
+*.mp4
+*.webm
+*.mkv
+*.m4a
+*.part
+
+# Binary (large, users download it themselves)
+yt-dlp.exe
+ffmpeg.exe
