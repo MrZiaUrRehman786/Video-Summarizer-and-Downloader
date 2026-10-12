@@ -4,7 +4,15 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const { GoogleGenAI, createUserContent, createPartFromUri } = require('@google/genai');
+
+// Optional: used to scan pages whose video address yt-dlp cannot find by itself.
+// Install with:  npm install playwright   then:  npx playwright install chromium
+let chromium = null;
+try { ({ chromium } = require('playwright')); }
+catch { console.log('Playwright is not installed: page scanning is disabled (yt-dlp-supported sites still work).'); }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +23,7 @@ const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-f
 
 const NOTES_LANGUAGE = 'English';   // notes are written in this language, whatever the video's language
 const MAX_AUDIO_MB = 150;           // safety limit for the audio fallback
+const RESOLVED_TTL_MS = 30 * 60 * 1000;
 
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -38,9 +47,37 @@ app.use(express.static('public'));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function isValidUrl(url) {
-    return url && /^https?:\/\//i.test(url);
+// ----- URL safety: any public website is allowed, but never your own computer or network -----
+function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) {
+        const [a, b] = ip.split('.').map(Number);
+        return a === 0 || a === 10 || a === 127 || a >= 224 ||
+            (a === 100 && b >= 64 && b <= 127) ||
+            (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) ||
+            (a === 192 && b === 168);
+    }
+    const v = ip.toLowerCase();
+    return v === '::1' || v === '::' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80') ||
+        v.startsWith('::ffff:127.') || v.startsWith('::ffff:10.') || v.startsWith('::ffff:192.168.');
 }
+
+async function isAllowedUrl(url) {
+    try {
+        const u = new URL(url);
+        if (!/^https?:$/.test(u.protocol)) return false;
+        const host = u.hostname.replace(/^\[|\]$/g, '');
+        if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) return false;
+        const addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
+        return addrs.length > 0 && addrs.every((a) => !isPrivateIp(a.address));
+    } catch {
+        return false;
+    }
+}
+
+const BAD_URL_MESSAGE = 'Please paste a valid public http(s) video or page link.';
+
+// ----- yt-dlp -----
 
 // Run yt-dlp and return { code, stdout, stderr }
 function runYtDlp(args) {
@@ -55,8 +92,94 @@ function runYtDlp(args) {
     });
 }
 
+function explainYtDlpError(stderr) {
+    const s = String(stderr);
+    if (/DRM/i.test(s)) return 'This video is DRM-protected and cannot be downloaded.';
+    if (/Sign in to confirm|not a bot/i.test(s)) return 'The site asked for a login or bot check. Try a different video or network.';
+    if (/HTTP Error 403|403: Forbidden/i.test(s)) return 'The site refused the download (error 403).';
+    if (/Unsupported URL/i.test(s)) return 'No downloadable video was found at this link.';
+    return 'Could not read the video: ' + s.slice(-300);
+}
+
+// ----- remembered "page link -> real video stream" results from the page scanner -----
+const resolved = new Map();   // pageUrl -> { url, referer, title, image, at }
+
+function getResolved(pageUrl) {
+    const r = resolved.get(pageUrl);
+    if (!r) return null;
+    if (Date.now() - r.at > RESOLVED_TTL_MS) { resolved.delete(pageUrl); return null; }
+    return r;
+}
+
+// The URL and extra flags yt-dlp should really use for this link
+function targetFor(videoUrl) {
+    const r = getResolved(videoUrl);
+    if (r) return { url: r.url, extra: ['--referer', r.referer] };
+    return { url: videoUrl, extra: [] };
+}
+
+// ----- page scanner (like the media detection in download managers) -----
+let scanning = false;
+
+async function sniffMedia(pageUrl) {
+    if (!chromium) {
+        throw new Error('Page scanning is not installed. Run "npm install playwright" and then "npx playwright install chromium", and restart the server.');
+    }
+    if (scanning) throw new Error('Another page is being scanned right now. Please try again in a minute.');
+    scanning = true;
+
+    let browser;
+    try {
+        browser = await chromium.launch({ headless: true });
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 }
+        });
+        const page = await context.newPage();
+
+        const found = new Map();   // stream url -> priority (2 = playlist/manifest, 1 = plain file)
+        const noiseRe = /doubleclick|googlesyndication|adservice|\/ads?\/|analytics|\.(ts|m4s|aac)(\?|$)/i;
+        const manifestRe = /\.(m3u8|mpd)(\?|$)/i;
+        const fileRe = /\.(mp4|webm|mkv|mov|m4v)(\?|$)/i;
+
+        const record = (u, ctype = '') => {
+            if (!u || u.startsWith('blob:') || u.startsWith('data:') || noiseRe.test(u)) return;
+            if (manifestRe.test(u) || /mpegurl|dash\+xml/i.test(ctype)) found.set(u, 2);
+            else if (fileRe.test(u) || /^video\//i.test(ctype)) found.set(u, found.get(u) || 1);
+        };
+        page.on('request', (req) => record(req.url()));
+        page.on('response', (resp) => record(resp.url(), resp.headers()['content-type'] || ''));
+
+        await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(4000);
+
+        // If nothing was loaded yet, press play on any video player on the page
+        for (let round = 0; round < 2 && found.size === 0; round++) {
+            for (const frame of page.frames()) {
+                await frame.evaluate(() => {
+                    document.querySelectorAll('video').forEach((v) => { v.muted = true; v.play().catch(() => {}); });
+                    document.querySelectorAll('[class*="play" i], [aria-label*="play" i], .vjs-big-play-button, .jw-icon-display')
+                        .forEach((el) => { try { el.click(); } catch (e) { /* ignore */ } });
+                }).catch(() => {});
+            }
+            await page.waitForTimeout(5000);
+        }
+
+        const meta = await page.evaluate(() => ({
+            title: document.title || '',
+            image: (document.querySelector('meta[property="og:image"]') || {}).content || ''
+        })).catch(() => ({ title: '', image: '' }));
+
+        const media = [...found.entries()].sort((a, b) => b[1] - a[1]).map(([u]) => u);
+        return { media, title: meta.title, image: meta.image };
+    } finally {
+        scanning = false;
+        if (browser) await browser.close().catch(() => {});
+    }
+}
+
 // Fetch the thumbnail on the server and embed it as a data URI,
-// so it displays even if the platform blocks hotlinking.
+// so it displays even if the site blocks hotlinking.
 async function thumbnailToDataUri(url) {
     if (!url) return null;
     try {
@@ -70,6 +193,46 @@ async function thumbnailToDataUri(url) {
     } catch {
         return url;
     }
+}
+
+function shapeInfo(info, titleOverride, imageOverride) {
+    const thumbUrl = imageOverride || info.thumbnail ||
+        (info.thumbnails && info.thumbnails.length ? info.thumbnails[info.thumbnails.length - 1].url : null);
+    return {
+        title: titleOverride || info.title || 'Untitled video',
+        uploader: info.uploader || info.channel || '',
+        duration: info.duration_string || '',
+        thumbUrl
+    };
+}
+
+// Read the video details. If yt-dlp does not know the site, scan the page for the real stream.
+async function getVideoInfo(videoUrl) {
+    const t = targetFor(videoUrl);
+    const first = await runYtDlp([...COMMON_ARGS, ...t.extra, '--skip-download', '--dump-single-json', '--', t.url]);
+
+    if (first.code === 0 && first.stdout.trim()) {
+        const cached = getResolved(videoUrl);
+        return shapeInfo(JSON.parse(first.stdout), cached && cached.title, cached && cached.image);
+    }
+
+    const canScan = !getResolved(videoUrl) && /Unsupported URL|No video formats|Unable to extract|no video/i.test(first.stderr);
+    if (!canScan) throw new Error(explainYtDlpError(first.stderr));
+
+    console.log('Site not supported by yt-dlp. Scanning the page for a video stream...');
+    const { media, title, image } = await sniffMedia(videoUrl);
+    if (!media.length) {
+        throw new Error('No video stream was found on this page. The video may be protected, need a login, or load only after you interact with it.');
+    }
+
+    for (const m of media.slice(0, 5)) {
+        const rr = await runYtDlp([...COMMON_ARGS, '--referer', videoUrl, '--skip-download', '--dump-single-json', '--', m]);
+        if (rr.code === 0 && rr.stdout.trim()) {
+            resolved.set(videoUrl, { url: m, referer: videoUrl, title, image, at: Date.now() });
+            return shapeInfo(JSON.parse(rr.stdout), title, image);
+        }
+    }
+    throw new Error('A video stream was found but could not be read (it may be protected).');
 }
 
 // ---------- captions path ----------
@@ -91,14 +254,16 @@ function vttToText(vtt) {
 // Download captions only (no video) and return them as text
 async function getTranscript(videoUrl) {
     const id = crypto.randomUUID();
+    const t = targetFor(videoUrl);
     const args = [
         ...COMMON_ARGS,
+        ...t.extra,
         '--skip-download',
         '--write-subs', '--write-auto-subs',
         '--sub-langs', 'en.*,en',
         '--sub-format', 'vtt',
         '-o', path.join(DOWNLOAD_DIR, `${id}.%(ext)s`),
-        '--', videoUrl
+        '--', t.url
     ];
 
     const { code, stderr } = await runYtDlp(args);
@@ -191,13 +356,15 @@ function summarizeTranscript(transcript) {
 // Download only the audio track as a small mono MP3 (needs ffmpeg)
 async function downloadAudio(videoUrl) {
     const id = crypto.randomUUID();
+    const t = targetFor(videoUrl);
     const args = [
         ...COMMON_ARGS,
+        ...t.extra,
         '-f', 'ba/b',
         '-x', '--audio-format', 'mp3',
         '--postprocessor-args', 'ffmpeg:-ac 1 -b:a 48k',   // mono, small file, fine for speech
         '-o', path.join(DOWNLOAD_DIR, `${id}.%(ext)s`),
-        '--', videoUrl
+        '--', t.url
     ];
 
     const { stderr } = await runYtDlp(args);
@@ -248,31 +415,17 @@ async function summarizeFromAudio(videoUrl) {
 // Video info for the card: title, uploader, duration, thumbnail
 app.get('/info', async (req, res) => {
     const videoUrl = req.query.url;
-    if (!isValidUrl(videoUrl)) {
-        return res.status(400).json({ error: 'Please provide a valid http(s) video URL.' });
+    if (!(await isAllowedUrl(videoUrl))) {
+        return res.status(400).json({ error: BAD_URL_MESSAGE });
     }
 
     try {
-        const { code, stdout, stderr } = await runYtDlp([
-            ...COMMON_ARGS,
-            '--skip-download',
-            '--dump-single-json',
-            '--', videoUrl
-        ]);
-
-        if (code !== 0 || !stdout.trim()) {
-            return res.status(500).json({ error: 'Could not read the video: ' + stderr.slice(-300) });
-        }
-
-        const info = JSON.parse(stdout);
-        const thumbUrl = info.thumbnail ||
-            (info.thumbnails && info.thumbnails.length ? info.thumbnails[info.thumbnails.length - 1].url : null);
-
+        const info = await getVideoInfo(videoUrl);
         res.json({
-            title: info.title || 'Untitled video',
-            uploader: info.uploader || info.channel || '',
-            duration: info.duration_string || '',
-            thumbnail: await thumbnailToDataUri(thumbUrl)
+            title: info.title,
+            uploader: info.uploader,
+            duration: info.duration,
+            thumbnail: await thumbnailToDataUri(info.thumbUrl)
         });
     } catch (err) {
         console.error('Info error:', err.message);
@@ -283,8 +436,8 @@ app.get('/info', async (req, res) => {
 // Summarize without downloading the video: captions first, audio as a fallback
 app.get('/summarize', async (req, res) => {
     const videoUrl = req.query.url;
-    if (!isValidUrl(videoUrl)) {
-        return res.status(400).json({ error: 'Please provide a valid http(s) video URL.' });
+    if (!(await isAllowedUrl(videoUrl))) {
+        return res.status(400).json({ error: BAD_URL_MESSAGE });
     }
 
     try {
@@ -312,20 +465,22 @@ app.get('/summarize', async (req, res) => {
 });
 
 // Download the video file
-app.get('/download', (req, res) => {
+app.get('/download', async (req, res) => {
     const videoUrl = req.query.url;
-    if (!isValidUrl(videoUrl)) {
-        return res.status(400).send('Please provide a valid http(s) video URL.');
+    if (!(await isAllowedUrl(videoUrl))) {
+        return res.status(400).send(BAD_URL_MESSAGE);
     }
 
     const id = crypto.randomUUID();
+    const t = targetFor(videoUrl);
     const args = [
         ...COMMON_ARGS,
+        ...t.extra,
         '--newline',
         '-f', 'bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b',
         '--merge-output-format', 'mp4',
         '-o', path.join(DOWNLOAD_DIR, `${id}.%(ext)s`),
-        '--', videoUrl
+        '--', t.url
     ];
 
     const ytDlp = spawn(ytDlpPath, args);
@@ -344,7 +499,7 @@ app.get('/download', (req, res) => {
     ytDlp.on('close', (code) => {
         if (code !== 0) {
             console.error(`yt-dlp exited with code ${code}`);
-            if (!res.headersSent) res.status(500).send('Download failed:\n' + errorLog.slice(-500));
+            if (!res.headersSent) res.status(500).send(explainYtDlpError(errorLog));
             return;
         }
         const file = fs.readdirSync(DOWNLOAD_DIR)
