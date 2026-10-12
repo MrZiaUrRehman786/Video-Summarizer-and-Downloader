@@ -209,4 +209,4 @@ ffmpeg.exe
 
 ## Author
 
-Your Name, Roll No., Course, University
+Zia Ur Rehman
